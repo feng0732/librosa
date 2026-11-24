@@ -473,6 +473,243 @@ def test_deemphasis(coef, zi, return_zf, dtype):
     assert x.dtype == y_deemph.dtype
 
 
+def _sharp_stereo(dtype=np.float64):
+    """Deterministic stereo signal with channel-specific seam transients."""
+    rng = np.random.default_rng(116)
+    y = 0.25 * rng.standard_normal((2, 72))
+
+    y[0, 15:18] += np.asarray([4.0, -3.5, 2.5])
+    y[1, 31:34] += np.asarray([-3.0, 4.5, -2.5])
+    y[0, 47:50] += np.asarray([-2.0, 3.0, -1.5])
+    y[1, 55:58] += np.asarray([2.5, -3.0, 2.0])
+
+    return y.astype(dtype, copy=False)
+
+
+def _block_edges(n, cuts):
+    boundaries = (0,) + tuple(cuts) + (n,)
+    return list(zip(boundaries[:-1], boundaries[1:]))
+
+
+def _preemphasis_blocks(y, cuts, coef=0.97, zi=None):
+    blocks = []
+    state = zi
+
+    for start, stop in _block_edges(y.shape[-1], cuts):
+        kwargs = {"coef": coef, "return_zf": True}
+        if state is not None:
+            kwargs["zi"] = state
+        block, state = librosa.effects.preemphasis(y[..., start:stop], **kwargs)
+        blocks.append(block)
+
+    return np.concatenate(blocks, axis=-1), state
+
+
+def _deemphasis_blocks(y, cuts, coef=0.97, zi=None):
+    blocks = []
+    state = zi
+
+    for start, stop in _block_edges(y.shape[-1], cuts):
+        block, state = librosa.effects.deemphasis(
+            y[..., start:stop], coef=coef, zi=state, return_zf=True
+        )
+        blocks.append(block)
+
+    return np.concatenate(blocks, axis=-1), state
+
+
+@pytest.mark.parametrize("cuts", [(2,), (16,), (32,), (69,), (16, 40), (2, 23, 41, 69)])
+@pytest.mark.parametrize("coef", [0.5, 0.97])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_preemphasis_stereo_blocks_match_whole(cuts, coef, dtype):
+    x = _sharp_stereo(dtype)
+    rtol = atol = 1e-6 if dtype == np.float32 else 1e-12
+
+    y_whole, zf_whole = librosa.effects.preemphasis(x, coef=coef, return_zf=True)
+    y_block, zf_block = _preemphasis_blocks(x, cuts, coef=coef)
+
+    assert y_block.shape == x.shape
+    assert y_block.dtype == x.dtype
+    np.testing.assert_allclose(y_block, y_whole, rtol=rtol, atol=atol)
+    np.testing.assert_allclose(zf_block, zf_whole, rtol=rtol, atol=atol)
+
+    # Every cut must preserve the causal sample equation at the new block edge.
+    for cut in cuts:
+        expected = x[..., cut] - coef * x[..., cut - 1]
+        np.testing.assert_allclose(y_block[..., cut], expected, rtol=rtol, atol=atol)
+
+    # Compare against independent mono streams to catch cross-channel states.
+    for channel in range(x.shape[0]):
+        y_mono, zf_mono = librosa.effects.preemphasis(
+            x[channel], coef=coef, return_zf=True
+        )
+        np.testing.assert_allclose(y_block[channel], y_mono, rtol=rtol, atol=atol)
+        np.testing.assert_allclose(
+            zf_block[channel], zf_mono, rtol=rtol, atol=atol
+        )
+
+    restored_block = librosa.effects.deemphasis(y_block, coef=coef)
+    restored_whole = librosa.effects.deemphasis(y_whole, coef=coef)
+    np.testing.assert_allclose(restored_block, x, rtol=rtol, atol=atol)
+    np.testing.assert_allclose(
+        restored_block, restored_whole, rtol=rtol, atol=atol
+    )
+
+
+def test_preemphasis_deemphasis_stereo_roundtrip_invariant_to_every_cut():
+    x = _sharp_stereo()
+    coef = 0.97
+
+    y_whole, zf_whole = librosa.effects.preemphasis(x, coef=coef, return_zf=True)
+    restored_whole = librosa.effects.deemphasis(y_whole, coef=coef)
+
+    for cut in range(2, x.shape[-1] - 1):
+        y_block, zf_block = _preemphasis_blocks(x, (cut,), coef=coef)
+
+        np.testing.assert_allclose(y_block, y_whole, atol=1e-12)
+        np.testing.assert_allclose(zf_block, zf_whole, atol=1e-12)
+
+        restored = librosa.effects.deemphasis(y_block, coef=coef)
+        np.testing.assert_allclose(restored, x, atol=1e-12)
+        np.testing.assert_allclose(restored, restored_whole, atol=1e-12)
+
+
+@pytest.mark.parametrize("cuts", [(2,), (16,), (69,), (7, 23, 41)])
+def test_preemphasis_stereo_explicit_state_is_channelwise(cuts):
+    x = _sharp_stereo()
+    coef = 0.97
+    zi = np.array([[1.1], [-0.8]], dtype=x.dtype)
+
+    y_whole, zf_whole = librosa.effects.preemphasis(
+        x, coef=coef, zi=zi, return_zf=True
+    )
+    y_block, zf_block = _preemphasis_blocks(x, cuts, coef=coef, zi=zi)
+
+    assert zf_block.shape == (2, 1)
+    np.testing.assert_allclose(y_block, y_whole)
+    np.testing.assert_allclose(zf_block, zf_whole)
+    assert not np.allclose(zf_block[0], zf_block[1])
+
+    for channel in range(2):
+        y_mono, zf_mono = librosa.effects.preemphasis(
+            x[channel], coef=coef, zi=float(zi[channel, 0]), return_zf=True
+        )
+        np.testing.assert_allclose(y_block[channel], y_mono)
+        np.testing.assert_allclose(zf_block[channel], zf_mono)
+
+
+@pytest.mark.parametrize("cuts", [(2,), (16,), (32,), (69,), (16, 40), (2, 23, 41, 69)])
+@pytest.mark.parametrize("coef", [0.5, 0.97])
+def test_deemphasis_stereo_blocks_match_whole(cuts, coef):
+    rng = np.random.default_rng(272)
+    y = 0.25 * rng.standard_normal((2, 72))
+    y[:, 16] += np.asarray([3.0, -3.0])
+    y[:, 40] += np.asarray([-2.5, 2.5])
+    zi = np.array([[0.9], [-0.7]])
+
+    y_whole, zf_whole = librosa.effects.deemphasis(
+        y, coef=coef, zi=zi, return_zf=True
+    )
+    y_block, zf_block = _deemphasis_blocks(y, cuts, coef=coef, zi=zi)
+
+    assert y_block.shape == y.shape
+    assert zf_block.shape == (2, 1)
+    np.testing.assert_allclose(y_block, y_whole)
+    np.testing.assert_allclose(zf_block, zf_whole)
+
+    for channel in range(2):
+        y_mono, zf_mono = librosa.effects.deemphasis(
+            y[channel], coef=coef, zi=float(zi[channel, 0]), return_zf=True
+        )
+        np.testing.assert_allclose(y_block[channel], y_mono)
+        np.testing.assert_allclose(zf_block[channel], zf_mono)
+
+
+@pytest.mark.parametrize("cuts", [(2,), (16,), (32,), (69,), (16, 40), (2, 23, 41, 69)])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_stereo_blockwise_roundtrip_continues_zero_state(cuts, dtype):
+    x = _sharp_stereo(dtype)
+    coef = 0.97
+    tol = 1e-6 if dtype == np.float32 else 1e-12
+    zi = np.zeros((2, 1), dtype=dtype)
+
+    emphasized, zf_emphasized = _preemphasis_blocks(x, cuts, coef=coef, zi=zi)
+    emphasized_whole, zf_whole = librosa.effects.preemphasis(
+        x, coef=coef, zi=zi, return_zf=True
+    )
+    np.testing.assert_allclose(emphasized, emphasized_whole, rtol=tol, atol=tol)
+    np.testing.assert_allclose(zf_emphasized, zf_whole, rtol=tol, atol=tol)
+
+    restored, zf_restored = _deemphasis_blocks(
+        emphasized, cuts, coef=coef, zi=np.zeros_like(zi)
+    )
+    restored_whole, zf_restored_whole = librosa.effects.deemphasis(
+        emphasized_whole, coef=coef, zi=np.zeros_like(zi), return_zf=True
+    )
+
+    np.testing.assert_allclose(restored, x, rtol=tol, atol=tol)
+    np.testing.assert_allclose(
+        restored, restored_whole, rtol=tol, atol=tol
+    )
+    np.testing.assert_allclose(
+        zf_restored, zf_restored_whole, rtol=tol, atol=tol
+    )
+
+
+@pytest.mark.parametrize("active_channel", [0, 1])
+@pytest.mark.parametrize("cuts", [(3,), (32,), (62,), (15, 31, 47)])
+def test_preemphasis_block_seam_transients_do_not_crosstalk(active_channel, cuts):
+    n = 64
+    silent_channel = 1 - active_channel
+    x = np.zeros((2, n))
+
+    for cut in cuts:
+        x[active_channel, cut] = 4.0
+        x[active_channel, cut - 1] = -3.0
+
+    y_block, zf_block = _preemphasis_blocks(x, cuts)
+
+    np.testing.assert_array_equal(y_block[silent_channel], np.zeros(n))
+    np.testing.assert_array_equal(zf_block[silent_channel], np.zeros(1))
+
+    y_mono, zf_mono = _preemphasis_blocks(x[active_channel], cuts)
+    np.testing.assert_allclose(y_block[active_channel], y_mono)
+    np.testing.assert_allclose(zf_block[active_channel], zf_mono)
+
+    restored_whole = librosa.effects.deemphasis(y_block)
+    np.testing.assert_array_equal(
+        restored_whole[silent_channel], np.zeros(n)
+    )
+    np.testing.assert_allclose(
+        restored_whole[active_channel], x[active_channel], atol=1e-12
+    )
+
+    restored_blocks, _ = _deemphasis_blocks(
+        y_block, cuts, zi=np.zeros((2, 1))
+    )
+    np.testing.assert_array_equal(
+        restored_blocks[silent_channel], np.zeros(n)
+    )
+    np.testing.assert_allclose(
+        restored_blocks[active_channel], x[active_channel], atol=1e-12
+    )
+
+
+def test_preemphasis_stereo_blocks_on_smooth_fixture(y_multi):
+    y, _sr = y_multi
+    n = y.shape[-1]
+    cuts = (n // 3, 2 * n // 3)
+
+    y_whole, zf_whole = librosa.effects.preemphasis(y, return_zf=True)
+    y_block, zf_block = _preemphasis_blocks(y, cuts)
+
+    np.testing.assert_allclose(y_block, y_whole)
+    np.testing.assert_allclose(zf_block, zf_whole)
+
+    restored = librosa.effects.deemphasis(y_block)
+    np.testing.assert_allclose(restored, y, atol=1e-12)
+
+
 @pytest.mark.parametrize("mode", ["sine", "triangle", "square"])
 @pytest.mark.parametrize("depth", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("phase", [0.0, np.pi / 2])
