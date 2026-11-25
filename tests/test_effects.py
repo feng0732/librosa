@@ -385,6 +385,197 @@ def test_split(y_split_idx, frame_length, hop_length, top_db):
         assert np.all(np.abs(i_true - intervals[i]) <= frame_length), intervals[i]
 
 
+@pytest.fixture
+def stereo_sample_timeline():
+    # frame_length=1 makes trim/split boundaries exact sample coordinates.
+    y = np.zeros((2, 48), dtype=np.float64)
+    y[0, 4:10] = 1.0
+    y[1, 20:27] = 0.16
+    return y
+
+
+@pytest.mark.parametrize("ref", [1.0, np.max])
+def test_trim_multichannel_shared_sample_timeline(stereo_sample_timeline, ref):
+    y = stereo_sample_timeline
+    params = dict(top_db=20, ref=ref, frame_length=1, hop_length=1)
+
+    y_trim, trim_idx = librosa.effects.trim(y, **params)
+    intervals = librosa.effects.split(y, **params)
+
+    expected_intervals = np.asarray([[4, 10], [20, 27]])
+    np.testing.assert_array_equal(trim_idx, [4, 27])
+    np.testing.assert_array_equal(intervals, expected_intervals)
+
+    # The index belongs to the original joint time axis. Slicing both channels
+    # with it must preserve their one-to-one sample correspondence.
+    np.testing.assert_array_equal(y_trim, y[:, 4:27])
+    np.testing.assert_array_equal(y_trim[0], y[0, 4:27])
+    np.testing.assert_array_equal(y_trim[1], y[1, 4:27])
+
+    # A talkspurt on either channel keeps the shared interval open.
+    for sample in (7, 23):
+        assert np.any((intervals[:, 0] <= sample) & (sample < intervals[:, 1]))
+
+
+def test_trim_split_multichannel_all_silence():
+    y = np.zeros((2, 16), dtype=np.float64)
+    params = dict(top_db=20, ref=1.0, frame_length=1, hop_length=1)
+
+    y_trim, trim_idx = librosa.effects.trim(y, **params)
+    intervals = librosa.effects.split(y, **params)
+
+    np.testing.assert_array_equal(trim_idx, [0, 0])
+    assert y_trim.shape == (2, 0)
+    assert intervals.shape == (0, 2)
+
+
+@pytest.fixture
+def stereo_interview_timeline():
+    frame_length = 128
+    hop_length = 32
+    speech_intervals = np.asarray(
+        [
+            [4 * hop_length, 12 * hop_length],
+            [20 * hop_length, 28 * hop_length],
+        ]
+    )
+
+    y = np.zeros((2, 32 * hop_length), dtype=np.float64)
+    y[0, speech_intervals[0, 0] : speech_intervals[0, 1]] = 1.0
+    y[1, speech_intervals[1, 0] : speech_intervals[1, 1]] = 0.20
+
+    return y, frame_length, hop_length, speech_intervals
+
+
+@pytest.mark.parametrize("ref", [1.0, np.max])
+def test_trim_split_multichannel_reference_boundaries(stereo_interview_timeline, ref):
+    y, frame_length, hop_length, _ = stereo_interview_timeline
+    params = dict(
+        top_db=20,
+        ref=ref,
+        frame_length=frame_length,
+        hop_length=hop_length,
+    )
+
+    y_trim, trim_idx = librosa.effects.trim(y, **params)
+    intervals = librosa.effects.split(y, **params)
+
+    expected_intervals = np.asarray([[96, 448], [640, 928]])
+    np.testing.assert_array_equal(trim_idx, [96, 928])
+    np.testing.assert_array_equal(intervals, expected_intervals)
+
+    # Trim and split expose the same shared timeline endpoints.
+    assert trim_idx[0] == intervals[0, 0]
+    assert trim_idx[1] == intervals[-1, 1]
+    np.testing.assert_array_equal(y_trim, y[:, trim_idx[0] : trim_idx[1]])
+
+
+@pytest.mark.parametrize("ref", [1.0, np.max])
+@pytest.mark.parametrize("top_db", [16, 18, 20, 22, 30])
+def test_trim_and_split_boundaries_map_to_original_samples(stereo_interview_timeline, ref, top_db):
+    y, frame_length, hop_length, speech_intervals = stereo_interview_timeline
+    params = dict(
+        top_db=top_db,
+        ref=ref,
+        frame_length=frame_length,
+        hop_length=hop_length,
+    )
+
+    y_trim, trim_idx = librosa.effects.trim(y, **params)
+    intervals = librosa.effects.split(y, **params)
+
+    assert intervals.shape == (2, 2)
+    np.testing.assert_array_equal(trim_idx, [intervals[0, 0], intervals[-1, 1]])
+    np.testing.assert_array_equal(y_trim, y[:, trim_idx[0] : trim_idx[1]])
+
+    n_samples = y.shape[-1]
+    assert np.all((0 <= intervals) & (intervals <= n_samples))
+    assert np.all(intervals % hop_length == 0)
+
+    for interval, speech_interval in zip(intervals, speech_intervals, strict=True):
+        speech_start, speech_end = speech_interval
+        speech_center = (speech_start + speech_end) // 2
+
+        # The returned sample coordinates stay within one analysis frame of
+        # the designed talkspurt boundaries and contain its center.
+        assert abs(interval[0] - speech_start) <= frame_length
+        assert abs(interval[1] - speech_end) <= frame_length
+        assert interval[0] <= speech_center < interval[1]
+
+    # Prefix, inter-interval gap, and suffix remain outside every segment.
+    for sample in (2 * hop_length, 16 * hop_length, 30 * hop_length):
+        assert not np.any((intervals[:, 0] <= sample) & (sample < intervals[:, 1]))
+
+
+@pytest.mark.parametrize("ref", [1.0, np.max])
+def test_multichannel_threshold_boundaries_are_nested(stereo_interview_timeline, ref):
+    y, frame_length, hop_length, _ = stereo_interview_timeline
+    top_db_values = [16, 18, 20, 22, 30]
+    results = []
+
+    for top_db in top_db_values:
+        trim_idx = librosa.effects.trim(
+            y,
+            top_db=top_db,
+            ref=ref,
+            frame_length=frame_length,
+            hop_length=hop_length,
+        )[1]
+        intervals = librosa.effects.split(
+            y,
+            top_db=top_db,
+            ref=ref,
+            frame_length=frame_length,
+            hop_length=hop_length,
+        )
+        results.append((trim_idx, intervals))
+
+    # Increasing top_db makes the criterion more permissive.  Stricter
+    # intervals must therefore be nested in the more permissive timeline.
+    for result_index in range(len(results) - 1):
+        strict_idx, strict_intervals = results[result_index]
+        loose_idx, loose_intervals = results[result_index + 1]
+
+        assert loose_idx[0] <= strict_idx[0]
+        assert loose_idx[1] >= strict_idx[1]
+
+        for start, end in strict_intervals:
+            contained = (loose_intervals[:, 0] <= start) & (end <= loose_intervals[:, 1])
+            assert np.any(contained)
+
+
+def test_reference_level_change_keeps_multichannel_speech(
+    stereo_interview_timeline,
+):
+    y_full_scale, frame_length, hop_length, speech_intervals = stereo_interview_timeline
+    y = 0.5 * y_full_scale  # Loud/ref-peak and quiet channels become 0.5 and 0.10.
+    params = dict(top_db=24, frame_length=frame_length, hop_length=hop_length)
+
+    y_absolute, idx_absolute = librosa.effects.trim(y, ref=1.0, **params)
+    intervals_absolute = librosa.effects.split(y, ref=1.0, **params)
+    y_peak, idx_peak = librosa.effects.trim(y, ref=np.max, **params)
+    intervals_peak = librosa.effects.split(y, ref=np.max, **params)
+
+    # Neither reference convention may remove either original talkspurt core.
+    for intervals in (intervals_absolute, intervals_peak):
+        for speech_start, speech_end in speech_intervals:
+            center = (speech_start + speech_end) // 2
+            assert np.any((intervals[:, 0] <= center) & (center < intervals[:, 1]))
+
+    # np.max follows the 0.5 RMS peak, so it is more permissive than ref=1.
+    assert idx_peak[0] <= idx_absolute[0]
+    assert idx_peak[1] >= idx_absolute[1]
+    for start, end in intervals_absolute:
+        assert np.any((intervals_peak[:, 0] <= start) & (end <= intervals_peak[:, 1]))
+
+    # The reference must affect the threshold, while both outputs still map
+    # exactly back to channel-aligned samples in the original recording.
+    assert not np.array_equal(idx_peak, idx_absolute)
+    assert not np.array_equal(intervals_peak, intervals_absolute)
+    np.testing.assert_array_equal(y_absolute, y[:, idx_absolute[0] : idx_absolute[1]])
+    np.testing.assert_array_equal(y_peak, y[:, idx_peak[0] : idx_peak[1]])
+
+
 @pytest.mark.parametrize("coef", [0.5, 0.99])
 @pytest.mark.parametrize("zi", [None, 0, [0]])
 @pytest.mark.parametrize("return_zf", [False, True])
