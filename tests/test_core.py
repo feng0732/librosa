@@ -794,6 +794,221 @@ def test_istft_reconstruction(y_chirp_istft, n_fft, hop_length, window):
     assert np.allclose(x, x_reconstructed, atol=1e-6)
 
 
+@pytest.mark.parametrize("center", [False, True])
+@pytest.mark.parametrize(
+    "n_fft, hop_length",
+    [(8, 2), (9, 2), (16, 3), (5, 5)],
+)
+@pytest.mark.parametrize("n_samples", [16, 17, 23, 31, 32, 33])
+@pytest.mark.parametrize("lead_shape", [(2,), (2, 3)])
+def test_stft_alignment_and_istft_target_length_on_partial_frames(
+    center, n_fft, hop_length, n_samples, lead_shape, rng
+):
+    # Non-integer numbers of windows and arbitrary leading/channel dimensions
+    # must preserve the documented frame grid and the requested output length.
+    y = rng.standard_normal((*lead_shape, n_samples))
+
+    D = librosa.stft(
+        y,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        window="hann",
+        center=center,
+    )
+
+    if center:
+        # librosa pads n_fft // 2 samples on each side.  For odd n_fft this is
+        # one sample shorter than n_fft, so derive the frame count from that
+        # padding contract rather than assuming n_samples // hop_length + 1.
+        padded_length = n_samples + 2 * (n_fft // 2)
+        n_frames = 1 + (padded_length - n_fft) // hop_length
+    else:
+        n_frames = 1 + (n_samples - n_fft) // hop_length
+
+    assert D.shape == (*lead_shape, n_fft // 2 + 1, n_frames)
+
+    frames = np.arange(n_frames)
+    sample_positions = frames * hop_length
+    np.testing.assert_array_equal(
+        librosa.frames_to_samples(frames, hop_length=hop_length),
+        sample_positions,
+    )
+    np.testing.assert_allclose(
+        librosa.frames_to_time(frames, sr=1.0, hop_length=hop_length),
+        sample_positions,
+    )
+
+    # Check the same alignment directly against the documented frame origins.
+    y_framed = y
+    if center:
+        padding = [(0, 0)] * y.ndim
+        padding[-1] = (n_fft // 2, n_fft // 2)
+        y_framed = np.pad(y, padding, mode="constant")
+
+    y_frames = librosa.util.frame(
+        y_framed,
+        frame_length=n_fft,
+        hop_length=hop_length,
+    )
+    window = librosa.filters.get_window("hann", n_fft, fftbins=True)
+    window = librosa.util.expand_to(window, ndim=y_frames.ndim, axes=-2)
+    D_expected = scipy.fft.rfft(window * y_frames, axis=-2)
+    np.testing.assert_allclose(D, D_expected)
+
+    y_reconstructed = librosa.istft(
+        D,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        window="hann",
+        center=center,
+        length=n_samples,
+    )
+    assert y_reconstructed.shape == y.shape
+    assert np.all(np.isfinite(y_reconstructed))
+
+
+@pytest.mark.parametrize("center", [False, True])
+@pytest.mark.parametrize("n_channels", [1, 2, 3])
+@pytest.mark.parametrize("target_length", [8, 15, 16, 17, 24])
+def test_istft_explicit_length_sets_multichannel_sample_count(center, n_channels, target_length, rng):
+    n_samples = 16
+    y = rng.standard_normal((n_channels, n_samples))
+    D = librosa.stft(y, n_fft=8, hop_length=2, center=center)
+
+    y_hat = librosa.istft(
+        D,
+        n_fft=8,
+        hop_length=2,
+        center=center,
+        length=target_length,
+    )
+    assert y_hat.shape == (n_channels, target_length)
+
+    out = np.empty((n_channels, target_length), dtype=y_hat.dtype)
+    y_out = librosa.istft(
+        D,
+        n_fft=8,
+        hop_length=2,
+        center=center,
+        length=target_length,
+        out=out,
+    )
+    assert y_out is out
+    assert y_out.shape == (n_channels, target_length)
+    np.testing.assert_allclose(y_out, y_hat)
+
+
+@pytest.mark.parametrize("center", [False, True])
+@pytest.mark.parametrize(
+    "n_fft, hop_length, window",
+    [(8, 2, "hann"), (9, 2, "hann"), (16, 4, "hann"), (8, 2, "boxcar")],
+)
+@pytest.mark.parametrize("n_samples", [16, 17, 23, 32, 33, 47])
+def test_istft_reconstructs_supported_samples_at_full_amplitude(center, n_fft, hop_length, window, n_samples, rng):
+    # Samples covered by the inverse window-normalization support are the
+    # "recoverable" part of an unmodified STFT.  Compare exactly there instead
+    # of demanding recovery of a tail that no complete analysis frame saw.
+    y = 0.75 * rng.standard_normal((2, n_samples))
+    D = librosa.stft(
+        y,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        window=window,
+        center=center,
+    )
+    y_hat = librosa.istft(
+        D,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        window=window,
+        center=center,
+        length=n_samples,
+    )
+
+    window_sum_square = librosa.filters.window_sumsquare(
+        window=window,
+        n_frames=D.shape[-1],
+        win_length=n_fft,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        dtype=y_hat.dtype,
+    )
+    start = n_fft // 2 if center else 0
+    window_sum_square = librosa.util.fix_length(window_sum_square[..., start:], size=n_samples)
+    support = window_sum_square > librosa.util.tiny(window_sum_square.dtype)
+
+    assert np.any(support)
+    np.testing.assert_allclose(
+        y_hat[..., support],
+        y[..., support],
+        rtol=1e-10,
+        atol=1e-10,
+    )
+
+    # With dense overlap and centered padding, every target sample belongs to
+    # the normalization support.  This is the case where the end must be
+    # genuinely reconstructed rather than silently zero-filled.
+    if center:
+        assert np.all(support)
+
+
+@pytest.mark.parametrize(
+    "center, n_fft, n_samples, recovered_positions, analyzed_end",
+    [
+        # Left-aligned frame 0 spans samples 0..3.
+        (False, 4, 7, (3, 1), 3),
+        # Centered frames at samples 0 and 4; the last one reaches sample 5.
+        (True, 4, 7, (5, 3), 5),
+        # Odd window: left-aligned frame 0 spans samples 0..4.
+        (False, 5, 9, (4, 2), 4),
+        # Odd window: centers at 0 and 5, with +/-2 sample support.
+        (True, 5, 9, (7, 5), 7),
+    ],
+)
+def test_istft_unanalyzed_tail_is_silent_multichannel(center, n_fft, n_samples, recovered_positions, analyzed_end):
+    # Put a distinct full-scale/quiet impulse in each channel at the last
+    # recoverable boundary and an even louder marker in the unanalyzed tail.
+    amplitudes = (1.0, 0.6)
+    y = np.zeros((2, n_samples), dtype=np.float64)
+    for channel, (position, amplitude) in enumerate(zip(recovered_positions, amplitudes, strict=True)):
+        y[channel, position] = amplitude
+
+    tail_start = analyzed_end + 1
+    y[:, -1] = (-0.95, 0.9)
+
+    D = librosa.stft(
+        y,
+        n_fft=n_fft,
+        hop_length=n_fft,
+        window="hann",
+        center=center,
+    )
+    y_hat = librosa.istft(
+        D,
+        n_fft=n_fft,
+        hop_length=n_fft,
+        window="hann",
+        center=center,
+        length=n_samples,
+    )
+
+    assert y_hat.shape == (2, n_samples)
+
+    # The audible event remains at its original sample and amplitude in each
+    # channel; channel handling cannot shift one channel's peak into another.
+    for channel, (position, amplitude) in enumerate(zip(recovered_positions, amplitudes, strict=True)):
+        peak_position = int(np.argmax(np.abs(y_hat[channel])))
+        assert peak_position == position
+        assert y_hat[channel, position] == pytest.approx(amplitude, abs=1e-12)
+
+    # Samples after the final analyzed support contain no STFT information.
+    # They must stay exact zeros for the requested target timeline; tiny
+    # normalization artifacts would be audible as a false tail.
+    tail = y_hat[:, tail_start:]
+    assert tail.size > 0
+    np.testing.assert_array_equal(tail, np.zeros_like(tail))
+
+
 @pytest.mark.parametrize("offset", [0, 1, 2])
 @pytest.mark.parametrize("duration", [None, 0, 0.5, 1, 2])
 @pytest.mark.parametrize("mono", [False, True])
