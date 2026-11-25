@@ -18,6 +18,7 @@ import itertools
 import numpy as np
 
 import librosa
+from librosa._cache import CacheManager
 
 
 @pytest.fixture(scope="module")
@@ -565,3 +566,356 @@ def test_onset_strength_complex_dtypes_and_edge_cases(rng):
     res_nocenter = librosa.onset.onset_strength(S=S_short, lag=2, center=False)
     assert res_nocenter.shape == (3,)
     assert np.all(res_nocenter == 0.0)
+
+
+def _segment_cut_curves():
+    """Construct separated events with unambiguous preceding energy minima."""
+    n_frames = 72
+    event_frames = np.array([14, 36, 58])
+    cut_frames = np.array([6, 28, 50])
+
+    onset_envelope = np.zeros(n_frames, dtype=np.float64)
+    onset_envelope[event_frames] = 10.0
+
+    # One clear energy basin immediately before each event.  The spacing makes
+    # a backtrack into the preceding sound segment immediately visible.
+    energy = np.interp(
+        np.arange(n_frames),
+        [0, 6, 14, 28, 36, 50, 58, n_frames - 1],
+        [1.0, 0.1, 1.0, 0.1, 1.0, 0.1, 1.0, 1.0],
+    )
+    return onset_envelope, energy, event_frames, cut_frames
+
+
+_CHAIN_PEAK_KWARGS = dict(
+    pre_max=1,
+    post_max=1,
+    pre_avg=1,
+    post_avg=1,
+    wait=1,
+    delta=0.05,
+)
+
+
+def test_onset_backtrack_finds_minimum_in_same_segment():
+    _, energy, events, cuts = _segment_cut_curves()
+
+    backtracked = librosa.onset.onset_backtrack(events, energy)
+
+    np.testing.assert_array_equal(backtracked, cuts)
+    assert np.all(backtracked >= 0)
+    assert np.all(backtracked < events)
+
+    # Every later cut stays after the preceding segment's peak/event.
+    assert np.all(cuts[1:] > events[:-1])
+
+    # The returned frames are genuine preceding minima.
+    assert np.all(energy[backtracked] <= energy[np.maximum(0, backtracked - 1)])
+    assert np.all(
+        energy[backtracked]
+        < energy[np.minimum(len(energy) - 1, backtracked + 1)]
+    )
+
+
+@pytest.mark.parametrize("sr", [16000, 22050, 44100])
+@pytest.mark.parametrize("hop_length", [64, 512, 1024])
+@pytest.mark.parametrize("units", ["frames", "samples", "time"])
+def test_backtracked_cut_units_are_representations_of_same_frame(sr, hop_length, units):
+    onset_envelope, energy, _events, cuts = _segment_cut_curves()
+
+    result = librosa.onset.onset_detect(
+        onset_envelope=onset_envelope,
+        sr=sr,
+        hop_length=hop_length,
+        backtrack=True,
+        energy=energy,
+        units=units,
+        **_CHAIN_PEAK_KWARGS,
+    )
+
+    if units == "frames":
+        frames = result
+        times = librosa.frames_to_time(result, sr=sr, hop_length=hop_length)
+    elif units == "samples":
+        frames = librosa.samples_to_frames(result, hop_length=hop_length)
+        times = librosa.samples_to_time(result, sr=sr)
+        np.testing.assert_array_equal(
+            result, librosa.frames_to_samples(cuts, hop_length=hop_length)
+        )
+    else:
+        # Seconds can sit one floating-point ulp below an exact frame boundary,
+        # so compare through the public time contract rather than requiring the
+        # floor-based inverse to be bit-exact.
+        frames = librosa.time_to_frames(result, sr=sr, hop_length=hop_length)
+        times = result
+        assert np.all(np.abs(frames - cuts) <= 1)
+
+    canonical_times = librosa.frames_to_time(cuts, sr=sr, hop_length=hop_length)
+    if units != "time":
+        np.testing.assert_array_equal(frames, cuts)
+    np.testing.assert_allclose(times, canonical_times, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize(
+    "window,expected_cut",
+    [((0, 22), 6), ((22, 44), 28), ((44, 72), 50)],
+)
+def test_cached_curve_slices_serve_multiple_clips(window, expected_cut):
+    onset_envelope, energy, _events, cuts = _segment_cut_curves()
+    start, stop = window
+    envelope_before = onset_envelope.copy()
+    energy_before = energy.copy()
+
+    clip_cut = librosa.onset.onset_detect(
+        onset_envelope=onset_envelope[start:stop],
+        sr=22050,
+        hop_length=512,
+        backtrack=True,
+        energy=energy[start:stop],
+        units="frames",
+        **_CHAIN_PEAK_KWARGS,
+    )
+
+    relative_cut = expected_cut - start
+    np.testing.assert_array_equal(clip_cut, np.array([relative_cut]))
+    assert clip_cut + start == expected_cut
+    assert expected_cut in cuts
+
+    # Slicing and normalization must not mutate the shared cached curves.
+    np.testing.assert_array_equal(onset_envelope, envelope_before)
+    np.testing.assert_array_equal(energy, energy_before)
+
+
+@pytest.mark.parametrize("hop_length", [256, 512])
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("energy_source", ["default", "envelope", "rms"])
+def test_audio_and_cached_envelope_paths_agree_on_onsets_and_cuts(
+    ysr, hop_length, normalize, energy_source
+):
+    y, sr = ysr
+    cached_envelope = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+
+    if energy_source == "rms":
+        energy = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+    elif energy_source == "envelope":
+        energy = cached_envelope
+    else:
+        energy = None
+
+    common = dict(
+        sr=sr,
+        hop_length=hop_length,
+        normalize=normalize,
+        energy=energy,
+    )
+
+    raw_from_audio = librosa.onset.onset_detect(y=y, backtrack=False, **common)
+    raw_from_cache = librosa.onset.onset_detect(
+        onset_envelope=cached_envelope, backtrack=False, **common
+    )
+    cuts_from_audio = librosa.onset.onset_detect(y=y, backtrack=True, **common)
+    cuts_from_cache = librosa.onset.onset_detect(
+        onset_envelope=cached_envelope, backtrack=True, **common
+    )
+
+    np.testing.assert_array_equal(raw_from_audio, raw_from_cache)
+    np.testing.assert_array_equal(cuts_from_audio, cuts_from_cache)
+
+    if energy is not None:
+        np.testing.assert_array_equal(
+            cuts_from_cache,
+            librosa.onset.onset_backtrack(raw_from_cache, energy),
+        )
+
+    assert np.all(cuts_from_cache >= 0)
+    assert np.all(cuts_from_cache <= raw_from_cache)
+
+
+def test_reusing_cached_curve_keeps_inputs_and_decisions_stable(ysr):
+    y, sr = ysr
+    hop_length = 512
+    cached_envelope = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+    energy = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+
+    y_before = y.copy()
+    envelope_before = cached_envelope.copy()
+    energy_before = energy.copy()
+
+    frame_cuts = librosa.onset.onset_detect(
+        onset_envelope=cached_envelope,
+        sr=sr,
+        hop_length=hop_length,
+        backtrack=True,
+        energy=energy,
+        units="frames",
+    )
+    sample_cuts = librosa.onset.onset_detect(
+        onset_envelope=cached_envelope,
+        sr=sr,
+        hop_length=hop_length,
+        backtrack=True,
+        energy=energy,
+        units="samples",
+    )
+    time_cuts = librosa.onset.onset_detect(
+        onset_envelope=cached_envelope,
+        sr=sr,
+        hop_length=hop_length,
+        backtrack=True,
+        energy=energy,
+        units="time",
+    )
+
+    for _ in range(3):
+        repeated_frames = librosa.onset.onset_detect(
+            onset_envelope=cached_envelope,
+            sr=sr,
+            hop_length=hop_length,
+            backtrack=True,
+            energy=energy,
+            units="frames",
+        )
+        np.testing.assert_array_equal(repeated_frames, frame_cuts)
+
+    np.testing.assert_array_equal(
+        sample_cuts, librosa.frames_to_samples(frame_cuts, hop_length=hop_length)
+    )
+    np.testing.assert_allclose(
+        time_cuts,
+        librosa.frames_to_time(frame_cuts, sr=sr, hop_length=hop_length),
+    )
+
+    # Neither the original audio nor the cached analysis may be consumed.
+    np.testing.assert_array_equal(y, y_before)
+    np.testing.assert_array_equal(cached_envelope, envelope_before)
+    np.testing.assert_array_equal(energy, energy_before)
+
+    fresh_envelope = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+    np.testing.assert_allclose(fresh_envelope, envelope_before)
+
+    # Joblib memory-mapped or shared cached arrays may be read-only; the chain
+    # must normalize private copies rather than mutating its inputs in place.
+    readonly_y = y.view()
+    readonly_envelope = cached_envelope.view()
+    readonly_energy = energy.view()
+    readonly_y.setflags(write=False)
+    readonly_envelope.setflags(write=False)
+    readonly_energy.setflags(write=False)
+
+    readonly_audio_cuts = librosa.onset.onset_detect(
+        y=readonly_y,
+        sr=sr,
+        hop_length=hop_length,
+        backtrack=True,
+        energy=readonly_energy,
+        units="frames",
+    )
+    readonly_cache_cuts = librosa.onset.onset_detect(
+        onset_envelope=readonly_envelope,
+        sr=sr,
+        hop_length=hop_length,
+        backtrack=True,
+        energy=readonly_energy,
+        units="frames",
+    )
+    np.testing.assert_array_equal(readonly_audio_cuts, frame_cuts)
+    np.testing.assert_array_equal(readonly_cache_cuts, frame_cuts)
+
+    audio_cuts = librosa.onset.onset_detect(
+        y=y,
+        sr=sr,
+        hop_length=hop_length,
+        backtrack=True,
+        energy=energy,
+        units="frames",
+    )
+    np.testing.assert_array_equal(audio_cuts, frame_cuts)
+
+
+def test_analysis_cache_reuse_and_direct_reanalysis_share_cuts(tmp_path, ysr):
+    y, sr = ysr
+    hop_length = 512
+    cache = CacheManager(str(tmp_path / "onset-cache"), verbose=0, level=30)
+    cached_strength = cache(level=30)(librosa.onset.onset_strength)
+
+    cached_envelope = cached_strength(y=y, sr=sr, hop_length=hop_length)
+    cached_envelope_again = cached_strength(y=y, sr=sr, hop_length=hop_length)
+    direct_envelope = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+
+    np.testing.assert_allclose(cached_envelope, direct_envelope, rtol=1e-12, atol=0.0)
+    np.testing.assert_allclose(
+        cached_envelope_again, direct_envelope, rtol=1e-12, atol=0.0
+    )
+
+    energy = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+    cached_cuts = librosa.onset.onset_detect(
+        onset_envelope=cached_envelope,
+        sr=sr,
+        hop_length=hop_length,
+        backtrack=True,
+        energy=energy,
+    )
+    direct_cuts = librosa.onset.onset_detect(
+        y=y,
+        sr=sr,
+        hop_length=hop_length,
+        backtrack=True,
+        energy=energy,
+    )
+    np.testing.assert_array_equal(cached_cuts, direct_cuts)
+
+
+@pytest.mark.parametrize("units", ["frames", "samples", "time"])
+@pytest.mark.parametrize("constant_value", [0.0, 1.0])
+def test_backtrack_without_usable_onset_returns_empty_cut_list(units, constant_value):
+    envelope = np.full(65, constant_value, dtype=np.float64)
+
+    cuts = librosa.onset.onset_detect(
+        onset_envelope=envelope,
+        sr=22050,
+        hop_length=512,
+        backtrack=True,
+        units=units,
+    )
+
+    assert isinstance(cuts, np.ndarray)
+    assert cuts.shape == (0,)
+
+
+@pytest.mark.parametrize("units", ["frames", "samples", "time"])
+def test_backtrack_silent_audio_returns_empty_cut_list(units):
+    sr = 22050
+    y = np.zeros(sr // 2, dtype=np.float32)
+
+    cuts = librosa.onset.onset_detect(
+        y=y,
+        sr=sr,
+        hop_length=512,
+        backtrack=True,
+        units=units,
+    )
+
+    assert isinstance(cuts, np.ndarray)
+    assert cuts.shape == (0,)
+
+
+def test_backtrack_invalid_mode_or_units_do_not_return_unprocessed_cuts():
+    envelope = np.zeros(65, dtype=np.float64)
+    envelope[20] = 1.0
+    original = envelope.copy()
+
+    with pytest.raises(librosa.ParameterValueError, match="sparse=True"):
+        librosa.onset.onset_detect(
+            onset_envelope=envelope,
+            backtrack=True,
+            sparse=False,
+        )
+
+    with pytest.raises(librosa.ParameterValueError, match="Invalid unit type"):
+        librosa.onset.onset_detect(
+            onset_envelope=envelope,
+            backtrack=True,
+            units="seconds",
+        )
+
+    np.testing.assert_array_equal(envelope, original)
